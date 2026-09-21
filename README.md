@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/coccinella-labs/second/main/.github/assets/thumbnail.png" alt="second" width="100%">
+</p>
+
 # Second
 
 Model-backed inline PR review through OpenRouter. A second pair of eyes on the diff: comments only on real defects, silent otherwise.
