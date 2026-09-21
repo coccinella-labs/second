@@ -1,0 +1,171 @@
+---
+name: Second
+description: Model-backed inline PR review through OpenRouter. Defaults to the free-quota router, comments only on real defects, stays silent otherwise.
+
+inputs:
+  github-token:
+    description: GitHub token for API access
+    required: false
+    default: ${{ github.token }}
+  openrouter-key:
+    description: OpenRouter API key (secret). Free quota suffices.
+    required: true
+  pr-number:
+    description: Pull request number to review. Defaults to the current event.
+    required: false
+    default: ""
+  model:
+    description: OpenRouter model slug. Defaults to the free-quota router, which auto-selects a free model.
+    required: false
+    default: "openrouter/free"
+  fallback-models:
+    description: Comma-separated fallback model slugs tried in order if the primary fails
+    required: false
+    default: ""
+  max-comments:
+    description: Maximum inline comments posted per run
+    required: false
+    default: "5"
+  max-diff-chars:
+    description: Truncate the reviewed diff beyond this many characters
+    required: false
+    default: "30000"
+  exclude-paths:
+    description: Comma-separated path prefixes skipped from review
+    required: false
+    default: "Cargo.lock,package-lock.json,yarn.lock,pnpm-lock.yaml"
+
+outputs:
+  posted:
+    description: Number of inline comments posted
+    value: ${{ steps.second.outputs.posted }}
+  model-used:
+    description: Model slug OpenRouter reports as actually used
+    value: ${{ steps.second.outputs.model-used }}
+
+runs:
+  using: composite
+  steps:
+    - id: second
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        OPENROUTER_KEY: ${{ inputs.openrouter-key }}
+        INPUT_PR_NUMBER: ${{ inputs.pr-number }}
+        INPUT_MODEL: ${{ inputs.model }}
+        INPUT_FALLBACKS: ${{ inputs.fallback-models }}
+        INPUT_MAX_COMMENTS: ${{ inputs.max-comments }}
+        INPUT_MAX_DIFF: ${{ inputs.max-diff-chars }}
+        INPUT_EXCLUDE: ${{ inputs.exclude-paths }}
+      run: |
+        set -uo pipefail
+
+        if [ -n "$INPUT_PR_NUMBER" ]; then
+          NUMBER="$INPUT_PR_NUMBER"
+        else
+          NUMBER="${{ github.event.pull_request.number }}"
+        fi
+        if [ -z "$NUMBER" ]; then
+          echo "No pull request number: set pr-number or run on a pull_request event." >&2
+          exit 1
+        fi
+        if [ -z "$OPENROUTER_KEY" ]; then
+          echo "Missing openrouter-key input (pass a secret)." >&2
+          exit 1
+        fi
+
+        PR_JSON=$(gh pr view "$NUMBER" --json headRefOid,baseRefOid)
+        HEAD_SHA=$(printf '%s' "$PR_JSON" | jq -r '.headRefOid')
+
+        # Collect the unified diff, minus excluded lockfiles and friends.
+        DIFF=$(gh pr diff "$NUMBER" --patch 2>/dev/null || gh pr diff "$NUMBER")
+        IFS=',' read -ra EXCLUDE <<< "$INPUT_EXCLUDE"
+        for prefix in "${EXCLUDE[@]}"; do
+          prefix=$(printf '%s' "$prefix" | xargs)
+          [ -z "$prefix" ] && continue
+          DIFF=$(printf '%s' "$DIFF" | awk -v p="^diff --git a/$prefix" '$0 ~ p {skip=1; next} /^diff --git / {skip=0} !skip')
+        done
+        DIFF_TRUNCATED="false"
+        if [ "${#DIFF}" -gt "$INPUT_MAX_DIFF" ]; then
+          DIFF="${DIFF:0:$INPUT_MAX_DIFF}"
+          DIFF_TRUNCATED="true"
+        fi
+        if [ -z "$(printf '%s' "$DIFF" | tr -d '[:space:]')" ]; then
+          echo "posted=0" >> "$GITHUB_OUTPUT"
+          echo "model-used=" >> "$GITHUB_OUTPUT"
+          echo "Nothing reviewable after exclusions."
+          exit 0
+        fi
+
+        SYSTEM_PROMPT='You review a pull request diff for real defects only. Comment ONLY when you find: a logic bug, a missing restore or cleanup that a sibling path performs, dead or unreachable code the diff introduces, an unhandled error path, or a test gap on changed behavior. Never comment on style, naming, formatting, or preferences. Never restate what the code does. Each finding must cite the exact mechanism. At most '"$INPUT_MAX_COMMENTS"' findings. Reply with a single JSON array, no other text. Each item: {"path": "repo-relative file path", "line": new-file line number inside the diff hunk, "body": "one-paragraph finding plus the concrete fix"}. Empty array [] when nothing qualifies.'
+
+        USER_PROMPT="Review this unified diff (truncated=${DIFF_TRUNCATED}):"$'\n\n'"${DIFF}"
+
+        # Candidate models: primary first, then fallbacks. Each entry is
+        # tried once; the first 2xx with usable choices wins.
+        MODELS="$INPUT_MODEL"
+        IFS=',' read -ra FB <<< "$INPUT_FALLBACKS"
+        for fb in "${FB[@]}"; do
+          fb=$(printf '%s' "$fb" | xargs)
+          [ -n "$fb" ] && MODELS="$MODELS"$'\n'"$fb"
+        done
+
+        REQUEST_BODY=$(jq -n \
+          --arg system "$SYSTEM_PROMPT" \
+          --arg user "$USER_PROMPT" \
+          '{messages: [{role: "system", content: $system}, {role: "user", content: $user}],
+            max_tokens: 2000, temperature: 0.2,
+            response_format: {type: "json_object"}}')
+
+        RESPONSE=""
+        MODEL_USED=""
+        while IFS= read -r model; do
+          [ -z "$model" ] && continue
+          echo "Trying model: $model"
+          RESP=$(curl -s --max-time 120 https://openrouter.ai/api/v1/chat/completions \
+            -H "Authorization: Bearer $OPENROUTER_KEY" \
+            -H "Content-Type: application/json" \
+            -H "X-Title: coccinella-labs/second" \
+            -d "$(printf '%s' "$REQUEST_BODY" | jq --arg m "$model" '.model = $m')")
+          CONTENT=$(printf '%s' "$RESP" | jq -r '.choices[0].message.content // empty' 2>/dev/null)
+          if [ -n "$CONTENT" ]; then
+            RESPONSE="$CONTENT"
+            MODEL_USED=$(printf '%s' "$RESP" | jq -r '.model // empty' 2>/dev/null)
+            break
+          fi
+          echo "Model $model failed or empty, trying next."
+        done <<< "$MODELS"
+
+        if [ -z "$RESPONSE" ]; then
+          echo "posted=0" >> "$GITHUB_OUTPUT"
+          echo "model-used=" >> "$GITHUB_OUTPUT"
+          echo "No model produced a review; skipping silently."
+          exit 0
+        fi
+
+        # Normalize: bare array or {"comments"|"findings"|"reviews": [...]}.
+        COMMENTS=$(printf '%s' "$RESPONSE" | jq -c 'if type=="array" then . else (.comments // .findings // .reviews // []) end | .[:'"$INPUT_MAX_COMMENTS"']' 2>/dev/null || echo "[]")
+        COUNT=$(printf '%s' "$COMMENTS" | jq 'length' 2>/dev/null || echo 0)
+        if [ "$COUNT" = "0" ]; then
+          echo "posted=0" >> "$GITHUB_OUTPUT"
+          echo "model-used=$MODEL_USED" >> "$GITHUB_OUTPUT"
+          echo "Model reported no qualifying findings (model: ${MODEL_USED:-unknown})."
+          exit 0
+        fi
+
+        # Post one review carrying all inline comments.
+        REVIEW_PAYLOAD=$(jq -n \
+          --arg sha "$HEAD_SHA" \
+          --argjson comments "$(printf '%s' "$COMMENTS" | jq '[.[] | select(.path and (.line|type)=="number" and .body) | {path, line, side: "RIGHT", body}]')" \
+          '{commit_id: $sha, event: "COMMENT", comments: $comments}')
+        POSTED=$(printf '%s' "$REVIEW_PAYLOAD" | jq '.comments | length')
+        if [ "$POSTED" = "0" ]; then
+          echo "posted=0" >> "$GITHUB_OUTPUT"
+          echo "model-used=$MODEL_USED" >> "$GITHUB_OUTPUT"
+          echo "Model findings lacked valid path/line anchors; nothing posted."
+          exit 0
+        fi
+        gh api "repos/$GITHUB_REPOSITORY/pulls/$NUMBER/reviews" --input <(printf '%s' "$REVIEW_PAYLOAD") > /dev/null
+        echo "posted=$POSTED" >> "$GITHUB_OUTPUT"
+        echo "model-used=$MODEL_USED" >> "$GITHUB_OUTPUT"
+        echo "Posted $POSTED inline comment(s) via $MODEL_USED."
