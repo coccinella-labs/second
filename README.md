@@ -42,6 +42,19 @@ Per the [OpenRouter docs](https://openrouter.ai/docs/guides/routing/routers/free
 | posted | Number of inline comments posted |
 | model-used | Model slug OpenRouter reports as actually used |
 
+## Using `openrouter/auto` instead
+
+Pass it as the `model` input; no code change needed, the request shape is identical:
+
+```yaml
+- uses: coccinella-labs/second@v1
+  with:
+    openrouter-key: ${{ secrets.OPENROUTER_API_KEY }}
+    model: openrouter/auto
+```
+
+Know what changes: per the [Auto Router docs](https://openrouter.ai/docs/guides/routing/routers/auto-router), `openrouter/auto` ranks by market spend and you pay the standard rate of whichever model is selected. It is not free-quota compatible: a $0-capped key cannot pay those rates, so requests will fail or be limited. Use it only with a funded key, optionally with the `auto-router` plugin (`allowed_models`, `excluded_models`, `cost_tier`) to bound selection. The `model-used` output reports what was actually picked.
+
 ## Review policy (baked into the prompt)
 
 Comment only on: logic bugs, missing restores a sibling path performs, introduced dead code, unhandled error paths, test gaps on changed behavior. Never style, naming, or preferences. Findings need exact mechanism plus concrete fix, anchored to diff lines.
