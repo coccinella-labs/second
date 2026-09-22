@@ -10,6 +10,10 @@ inputs:
   openrouter-key:
     description: OpenRouter API key (secret). Free quota suffices.
     required: true
+  repository:
+    description: Repository to review, in owner/name form
+    required: false
+    default: ${{ github.repository }}
   pr-number:
     description: Pull request number to review. Defaults to the current event.
     required: false
@@ -50,6 +54,7 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{ inputs.github-token }}
+        GH_REPO: ${{ inputs.repository }}
         OPENROUTER_KEY: ${{ inputs.openrouter-key }}
         INPUT_PR_NUMBER: ${{ inputs.pr-number }}
         INPUT_MODEL: ${{ inputs.model }}

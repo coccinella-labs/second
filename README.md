@@ -28,6 +28,7 @@ Per the [OpenRouter docs](https://openrouter.ai/docs/guides/routing/routers/free
 |-------|-------------|---------|
 | github-token | GitHub token for API access | `github.token` |
 | openrouter-key | OpenRouter API key (secret, free quota suffices) | required |
+| repository | Repository to review (`owner/name`) | `github.repository` |
 | pr-number | PR to review (defaults to the event) | - |
 | model | OpenRouter model slug | `openrouter/free` |
 | fallback-models | Comma-separated fallback slugs | - |
